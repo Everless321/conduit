@@ -1,0 +1,17 @@
+[package]
+name = "conduit-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conduit-admin"
+path = "src/main.rs"
+
+[dependencies]
+conduit-core = { path = "../conduit-core" }
+conduit-store-dibs = { path = "../conduit-store-dibs" }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+chrono.workspace = true
