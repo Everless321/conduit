@@ -608,6 +608,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64",
  "chrono",
  "conduit-core",
@@ -636,7 +637,6 @@ dependencies = [
  "conduit-engine",
  "conduit-store-dibs",
  "http",
- "rmcp",
  "serde",
  "tokio",
  "tower",

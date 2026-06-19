@@ -1,7 +1,9 @@
-mod auth;
+//! Reference deployment of conduit-engine: a standalone binary wiring the
+//! Dibs adapters and serving the MCP router over HTTP. Embedders should depend
+//! on `conduit-engine` directly and mount [`conduit_engine::mcp_router`] into
+//! their own app instead of running this binary.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use axum::{
@@ -12,22 +14,20 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::tower::{StreamableHttpServerConfig, StreamableHttpService};
 use tracing_subscriber::EnvFilter;
 
 use conduit_core::crypto::MasterKey;
 use conduit_core::policy::CommandPolicy;
 use conduit_core::{AuditSink, Authorizer, ServerCatalog, TokenValidator};
-use conduit_engine::{AppState, ConduitHandler, RateLimiter};
+use conduit_engine::{mcp_router, spawn_session_cleaner, AppState, RateLimiter};
 use conduit_store_dibs::DibsStore;
-
-use crate::auth::bearer_auth;
 
 #[derive(Parser, Debug)]
 #[command(name = "conduit-server", version)]
 struct Cli {
-    #[arg(long, default_value = "0.0.0.0:7077", env = "CONDUIT_BIND")]
+    /// Bind address. Defaults to localhost only; set explicitly (e.g.
+    /// `0.0.0.0:7077`) or front it with a reverse proxy to expose it.
+    #[arg(long, default_value = "127.0.0.1:7077", env = "CONDUIT_BIND")]
     bind: String,
     #[arg(long, default_value = "./conduit.db", env = "CONDUIT_DB")]
     db: String,
@@ -81,23 +81,10 @@ async fn main() -> anyhow::Result<()> {
 
     spawn_session_cleaner(state.clone());
 
-    let handler_state = state.clone();
-    let mcp_service = StreamableHttpService::new(
-        move || Ok(ConduitHandler::new(handler_state.clone())),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default().disable_allowed_hosts(),
-    );
-
-    let mcp_router = Router::new()
-        .nest_service("/mcp", mcp_service)
-        .layer(axum::middleware::from_fn_with_state(validator.clone(), bearer_auth))
-        .with_state(validator.clone());
-
-    let health_state = state.clone();
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .with_state(health_state)
-        .merge(mcp_router);
+        .with_state(state.clone())
+        .merge(mcp_router(state.clone(), validator.clone()));
 
     let listener = tokio::net::TcpListener::bind(&cli.bind).await.context("bind")?;
     tracing::info!(addr = %cli.bind, "conduit-server listening");
@@ -121,30 +108,4 @@ async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             active_sessions: state.sessions.len(),
         }),
     )
-}
-
-fn spawn_session_cleaner(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            tick.tick().await;
-            let cutoff = state.idle_timeout_secs;
-            if cutoff <= 0 {
-                continue;
-            }
-            let mut to_close: Vec<String> = Vec::new();
-            for entry in state.sessions.iter() {
-                if entry.value().idle_secs() > cutoff {
-                    to_close.push(entry.key().clone());
-                }
-            }
-            for id in to_close {
-                if let Some((_, sess)) = state.sessions.remove(&id) {
-                    tracing::info!(session = %id, idle = sess.idle_secs(), "cleaning idle session");
-                    state.stop_jobs_for_session(&sess.id);
-                    sess.close().await;
-                }
-            }
-        }
-    });
 }
