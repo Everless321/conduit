@@ -8,6 +8,50 @@ use async_trait::async_trait;
 use crate::models::{AuditEntry, AuditQuery, AuthContext, ResolvedServer, ServerSummary};
 use crate::Result;
 
+/// Which call produced the output being filtered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputStream {
+    /// A one-shot `exec` result: complete stdout/stderr plus a final exit code.
+    Exec,
+    /// One incremental chunk from polling a background job (`exec_poll`). The
+    /// filter is invoked once per poll, so a transform that could straddle a
+    /// chunk boundary (e.g. a secret split across two reads) is not guaranteed
+    /// to match — keep poll-chunk filters line- or byte-local.
+    PollChunk,
+}
+
+/// Who and what produced the output, passed to [`OutputFilter::filter`].
+pub struct OutputContext<'a> {
+    pub auth: &'a AuthContext,
+    pub server_alias: &'a str,
+    /// The command that produced this output.
+    pub command: &'a str,
+    pub stream: OutputStream,
+}
+
+/// The mutable captured output handed to an [`OutputFilter`]. Rewrite the
+/// fields in place to redact, filter, or rewrite what the caller receives.
+pub struct CapturedOutput {
+    pub stdout: String,
+    pub stderr: String,
+    /// Final exit code: `Some` for a completed `exec`, `None` for a poll chunk
+    /// of a still-running job. A filter may override it.
+    pub exit_code: Option<i32>,
+}
+
+/// Post-execution transform applied to SSH output just before it is returned to
+/// the MCP caller (the fifth seam, alongside [`TokenValidator`], [`ServerCatalog`],
+/// [`Authorizer`], and [`AuditSink`]). Deployments install none by default
+/// (passthrough); wire one at assembly time with `AppState::with_output_filter`.
+///
+/// Note the audit trail records the **raw** output, not the filtered result —
+/// the filter only shapes the caller-facing response. If you also need to keep
+/// secrets out of the audit log, redact in your [`AuditSink`] implementation.
+#[async_trait]
+pub trait OutputFilter: Send + Sync {
+    async fn filter(&self, ctx: &OutputContext<'_>, out: &mut CapturedOutput);
+}
+
 /// Resolves a presented MCP bearer token into an [`AuthContext`] (authentication).
 #[async_trait]
 pub trait TokenValidator: Send + Sync {

@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use conduit_core::models::{AuthContext, ResolvedServer};
+use conduit_core::{CapturedOutput, OutputContext, OutputStream};
 
 use crate::audit::{log, AuditCtx};
 use crate::session::{DirEntry, SshSession, DEFAULT_JOB_MAX_SECS, MAX_JOBS_PER_SESSION, MAX_JUMP_HOPS};
@@ -217,6 +218,29 @@ impl ConduitHandler {
             session_id: session_id.to_string(),
         }
     }
+
+    /// Run captured SSH output through the installed [`OutputFilter`], if any.
+    /// Returns the (possibly rewritten) output; a no-op passthrough when no
+    /// filter is wired. Audit logging happens on the raw output upstream of
+    /// this call — only the caller-facing response is transformed.
+    async fn filter_output(
+        &self,
+        auth: &AuthContext,
+        server_alias: &str,
+        command: &str,
+        stream: OutputStream,
+        out: CapturedOutput,
+    ) -> CapturedOutput {
+        match &self.state.output_filter {
+            Some(filter) => {
+                let ctx = OutputContext { auth, server_alias, command, stream };
+                let mut out = out;
+                filter.filter(&ctx, &mut out).await;
+                out
+            }
+            None => out,
+        }
+    }
 }
 
 #[tool_router]
@@ -358,11 +382,24 @@ impl ConduitHandler {
                     e.duration_ms = Some(dur);
                 })
                 .await;
+                let filtered = self
+                    .filter_output(
+                        &auth,
+                        &session.server_alias,
+                        &params.command,
+                        OutputStream::Exec,
+                        CapturedOutput {
+                            stdout: out.stdout,
+                            stderr: out.stderr,
+                            exit_code: Some(out.exit_code),
+                        },
+                    )
+                    .await;
                 Ok(CallToolResult::structured(
                     serde_json::to_value(ExecOutput {
-                        stdout: out.stdout,
-                        stderr: out.stderr,
-                        exit_code: out.exit_code,
+                        stdout: filtered.stdout,
+                        stderr: filtered.stderr,
+                        exit_code: filtered.exit_code.unwrap_or(out.exit_code),
                         duration_ms: out.duration_ms,
                         truncated: out.truncated,
                     })
@@ -489,16 +526,31 @@ impl ConduitHandler {
             params.stdout_offset.unwrap_or(0),
             params.stderr_offset.unwrap_or(0),
         );
+        // Filter the chunk text only — the offsets index the raw ring buffer and
+        // must stay untouched so the next poll resumes from the right position.
+        let filtered = self
+            .filter_output(
+                &auth,
+                &job.server_alias,
+                &job.command,
+                OutputStream::PollChunk,
+                CapturedOutput {
+                    stdout: String::from_utf8_lossy(&snap.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&snap.stderr).into_owned(),
+                    exit_code: snap.exit_code,
+                },
+            )
+            .await;
         Ok(CallToolResult::structured(
             serde_json::to_value(ExecPollOutput {
-                stdout: String::from_utf8_lossy(&snap.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&snap.stderr).into_owned(),
+                stdout: filtered.stdout,
+                stderr: filtered.stderr,
                 stdout_offset: snap.stdout_offset,
                 stderr_offset: snap.stderr_offset,
                 stdout_gap: snap.stdout_gap,
                 stderr_gap: snap.stderr_gap,
                 running: snap.running,
-                exit_code: snap.exit_code,
+                exit_code: filtered.exit_code,
             })
             .unwrap(),
         ))

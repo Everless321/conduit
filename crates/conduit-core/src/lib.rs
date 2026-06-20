@@ -10,4 +10,7 @@ pub mod policy;
 pub mod ports;
 
 pub use error::{Error, Result};
-pub use ports::{AuditSink, Authorizer, ServerCatalog, TokenValidator};
+pub use ports::{
+    AuditSink, Authorizer, CapturedOutput, OutputContext, OutputFilter, OutputStream,
+    ServerCatalog, TokenValidator,
+};

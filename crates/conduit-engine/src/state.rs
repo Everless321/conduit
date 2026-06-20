@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use conduit_core::{AuditSink, Authorizer, ServerCatalog};
+use conduit_core::{AuditSink, Authorizer, OutputFilter, ServerCatalog};
 
 use crate::ratelimit::RateLimiter;
 use crate::session::{BgJob, SshSession};
@@ -19,6 +19,9 @@ pub struct AppState {
     pub jobs: Arc<DashMap<String, Arc<BgJob>>>,
     pub limiter: Arc<RateLimiter>,
     pub idle_timeout_secs: i64,
+    /// Optional post-execution transform on SSH output. `None` = passthrough.
+    /// Install with [`AppState::with_output_filter`].
+    pub output_filter: Option<Arc<dyn OutputFilter>>,
 }
 
 impl AppState {
@@ -55,6 +58,15 @@ impl AppState {
             jobs: Arc::new(DashMap::new()),
             limiter: Arc::new(limiter),
             idle_timeout_secs,
+            output_filter: None,
         }
+    }
+
+    /// Install an [`OutputFilter`] that rewrites SSH output before it is returned
+    /// to the caller. Chain it onto `new` at assembly time:
+    /// `Arc::new(AppState::new(..).with_output_filter(Arc::new(MyFilter)))`.
+    pub fn with_output_filter(mut self, filter: Arc<dyn OutputFilter>) -> Self {
+        self.output_filter = Some(filter);
+        self
     }
 }
