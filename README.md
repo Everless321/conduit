@@ -2,12 +2,12 @@
 
 可扩展的 SSH-over-MCP 基础库。AI 通过 MCP 工具操作远端服务器，**永远拿不到凭据**，只拿到不透明的 `session_id`。
 
-权限、服务器目录、认证、审计都是**可插拔的端口（trait）**——内核引擎只依赖 trait，不认识任何具体存储。要换数据源或权限模型，写一个新 crate 实现对应 trait，在 `conduit-server` 的装配处改几行即可，引擎零改动。
+权限、服务器目录、认证、审计、输出变换都是**可插拔的端口（trait）**——内核引擎只依赖 trait，不认识任何具体存储。要换数据源或权限模型，写一个新 crate 实现对应 trait，在 `conduit-server` 的装配处改几行即可，引擎零改动。
 
 ## 架构（Ports & Adapters）
 
 ```
-conduit-core        纯类型 + 4 个 trait 端口（无 sqlx / axum）
+conduit-core        纯类型 + 5 个 trait 端口（无 sqlx / axum）
 conduit-engine      SSH 会话 + MCP 工具 + 限流 + 审计 + 可挂载的 HTTP 路由 ← 复用内核（中间件）
 conduit-store-dibs  SQLite/Dibs 适配器，实现 3 个存储 trait ← 可替换
 conduit-server      参考部署：装配适配器 + 引擎 + 自己 bind/serve（可不用，改用嵌入）
@@ -16,14 +16,18 @@ conduit-admin       运维 CLI（genkey、审计查询）
 
 ## 作为中间件嵌入（推荐）
 
-`conduit-engine` 自身**不绑定端口、不决定监听地址**。宿主程序提供 4 个端口适配器，
-把 `mcp_router` 挂进自己的 `axum` app，由宿主决定 bind/TLS/Host 校验：
+`conduit-engine` 自身**不绑定端口、不决定监听地址**。宿主程序提供 4 个必需端口适配器
+（外加可选的 `OutputFilter`），把 `mcp_router` 挂进自己的 `axum` app，由宿主决定 bind/TLS/Host 校验：
 
 ```rust
 use std::sync::Arc;
 use conduit_engine::{AppState, RateLimiter, mcp_router, spawn_session_cleaner};
 
-let state = Arc::new(AppState::new(catalog, authz, audit, RateLimiter::new(30), 1800));
+let state = Arc::new(
+    AppState::new(catalog, authz, audit, RateLimiter::new(30), 1800)
+        // 可选：返回前变换 SSH 输出（脱敏/过滤/改写）。不挂即 passthrough。
+        .with_output_filter(Arc::new(RedactSecrets)),
+);
 spawn_session_cleaner(state.clone());
 
 // 挂进宿主自己的路由；监听地址由宿主决定
@@ -35,7 +39,7 @@ axum::serve(listener, app).await?;
 `/mcp` 已被 Bearer token 网关保护（无环境凭据），网络暴露与 Host 校验交给宿主/反向代理。
 不想嵌入、想直接跑独立服务，用下面的 `conduit-server`。
 
-## 四个端口（`conduit-core/src/ports.rs`）
+## 五个端口（`conduit-core/src/ports.rs`）
 
 | Trait | 职责 | 默认实现 |
 |-------|------|---------|
@@ -43,8 +47,9 @@ axum::serve(listener, app).await?;
 | `ServerCatalog` | 服务器目录 + 访问控制（list/resolve，吐已解密凭据） | `DibsStore` |
 | `Authorizer` | 命令级权限（黑名单/放行规则） | `CommandPolicy`（core 内置） |
 | `AuditSink` | 审计落盘 / 查询 | `DibsStore` |
+| `OutputFilter` | 返回前变换 SSH 输出（脱敏/过滤/改写），**可选** | 无（不挂即 passthrough） |
 
-## 四个端口的最小 demo
+## 五个端口的最小 demo
 
 下面是每个端口的最小可跑实现（内存 / 静态，仅演示与本地起步用）。完整契约、字段表、错误映射见 [docs/INTEGRATION.md §1.1](docs/INTEGRATION.md)。
 
@@ -165,6 +170,31 @@ impl AuditSink for LogAudit {
     }
 }
 ```
+
+### `OutputFilter` — 输出变换（可选）
+
+返回前对 SSH 输出做脱敏/过滤/改写。`exec`（一次性）与 `exec_poll`（背景任务，逐分片）都会过它。
+`ctx` 带 `auth`（role/user）、`server_alias`、`command`、`stream`，可按维度分流。
+
+> 审计记的是**原始**输出，filter 只改面向调用方的返回；想连审计也脱敏请在 `AuditSink` 里做。
+> 背景任务是**逐分片**调用的，跨分片边界的整体替换不保证命中——poll 的 filter 请写成按行/按字节局部的。
+
+```rust
+use async_trait::async_trait;
+use conduit_core::{CapturedOutput, OutputContext, OutputFilter};
+
+pub struct RedactSecrets;
+
+#[async_trait]
+impl OutputFilter for RedactSecrets {
+    async fn filter(&self, _ctx: &OutputContext<'_>, out: &mut CapturedOutput) {
+        // 原地改写 out.stdout / out.stderr；过滤/截断时还可改 out.exit_code
+        out.stdout = out.stdout.replace("password=", "password=***");
+    }
+}
+```
+
+挂载见上文「作为中间件嵌入」的 `AppState::with_output_filter`；不挂即 passthrough，行为不变。
 
 ## 接一个新后端
 
