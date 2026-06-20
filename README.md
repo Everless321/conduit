@@ -44,6 +44,128 @@ axum::serve(listener, app).await?;
 | `Authorizer` | 命令级权限（黑名单/放行规则） | `CommandPolicy`（core 内置） |
 | `AuditSink` | 审计落盘 / 查询 | `DibsStore` |
 
+## 四个端口的最小 demo
+
+下面是每个端口的最小可跑实现（内存 / 静态，仅演示与本地起步用）。完整契约、字段表、错误映射见 [docs/INTEGRATION.md §1.1](docs/INTEGRATION.md)。
+
+### `TokenValidator` — 认证
+
+```rust
+use std::collections::HashMap;
+use async_trait::async_trait;
+use conduit_core::models::AuthContext;
+use conduit_core::{Error, Result, TokenValidator};
+
+pub struct StaticTokens(pub HashMap<String, AuthContext>);
+
+#[async_trait]
+impl TokenValidator for StaticTokens {
+    async fn validate(&self, token: &str) -> Result<AuthContext> {
+        if token.is_empty() {
+            return Err(Error::Unauthorized("empty token".into())); // 空 token 必拒
+        }
+        self.0
+            .get(token)
+            .cloned()
+            .ok_or_else(|| Error::Unauthorized("unknown token".into()))
+    }
+}
+```
+
+### `ServerCatalog` — 服务器目录 + 访问控制
+
+`resolve` 里直接吐明文凭据——真实场景在此解密 / 调 Vault。
+
+```rust
+use async_trait::async_trait;
+use conduit_core::models::{ResolvedServer, ServerSummary};
+use conduit_core::{Error, Result, ServerCatalog};
+
+pub struct StaticCatalog {
+    /// user_id → 该用户可见的服务器（含解密后的凭据）
+    pub by_user: std::collections::HashMap<i64, Vec<ResolvedServer>>,
+}
+
+#[async_trait]
+impl ServerCatalog for StaticCatalog {
+    async fn list(&self, user_id: i64) -> Result<Vec<ServerSummary>> {
+        Ok(self
+            .by_user
+            .get(&user_id)
+            .into_iter()
+            .flatten()
+            .map(|s| ServerSummary { alias: s.alias.clone(), description: None, tags: None })
+            .collect())
+    }
+
+    async fn resolve(&self, user_id: i64, alias: &str) -> Result<ResolvedServer> {
+        self.by_user
+            .get(&user_id)
+            .into_iter()
+            .flatten()
+            .find(|s| s.alias == alias)
+            .cloned()
+            // 无权 == 不存在：统一回 NotFound，不泄露存在性
+            .ok_or_else(|| Error::NotFound(alias.to_string()))
+    }
+}
+```
+
+### `Authorizer` — 命令级权限
+
+按 `role` 做 RBAC：admin 放行一切，其余角色禁 `sudo` / 关机。
+
+```rust
+use async_trait::async_trait;
+use conduit_core::models::AuthContext;
+use conduit_core::{Authorizer, Error, Result};
+
+pub struct RoleAuthorizer;
+
+#[async_trait]
+impl Authorizer for RoleAuthorizer {
+    async fn authorize_exec(&self, auth: &AuthContext, _server: &str, command: &str) -> Result<()> {
+        if auth.role == "admin" {
+            return Ok(());
+        }
+        let c = command.trim_start();
+        if c.starts_with("sudo ") || c.contains("shutdown") || c.contains("reboot") {
+            return Err(Error::Forbidden(format!("role '{}' may not run: {command}", auth.role)));
+        }
+        Ok(())
+    }
+}
+```
+
+> `authorize_exec` 是 `async`，实现里可做网络 I/O——可调外部 HTTP/gRPC 策略服务做**动态鉴权**（注意超时、fail-open/closed、保留本地硬红线）。
+
+### `AuditSink` — 审计
+
+只打日志、不持久化；`query` 返回空。
+
+```rust
+use async_trait::async_trait;
+use conduit_core::models::{AuditEntry, AuditQuery};
+use conduit_core::{AuditSink, Result};
+
+pub struct LogAudit;
+
+#[async_trait]
+impl AuditSink for LogAudit {
+    async fn write(&self, e: &AuditEntry) {
+        // write 无 Result——失败只能内部 warn，绝不能让调用方失败
+        tracing::info!(
+            user = e.user_id, server = %e.server_alias,
+            event = %e.event, command = ?e.command, "audit"
+        );
+    }
+
+    async fn query(&self, _q: &AuditQuery) -> Result<Vec<AuditEntry>> {
+        Ok(vec![])
+    }
+}
+```
+
 ## 接一个新后端
 
 举例：把服务器目录与权限换成静态 YAML / Postgres / Vault / REST——
