@@ -87,6 +87,7 @@ pub fn spawn_session_cleaner(state: Arc<AppState>) {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
+            state.ingest.sweep_expired();
             let cutoff = state.idle_timeout_secs;
             if cutoff <= 0 {
                 continue;

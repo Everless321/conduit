@@ -4,6 +4,7 @@ use dashmap::DashMap;
 
 use conduit_core::{AuditSink, Authorizer, OutputFilter, ServerCatalog};
 
+use crate::ingest::{IngestStore, DEFAULT_INGEST_TTL_SECS, DEFAULT_MAX_UPLOAD_BYTES};
 use crate::ratelimit::RateLimiter;
 use crate::session::{BgJob, SshSession, MAX_OUTPUT_BYTES};
 
@@ -26,6 +27,10 @@ pub struct AppState {
     /// Optional post-execution transform on SSH output. `None` = passthrough.
     /// Install with [`AppState::with_output_filter`].
     pub output_filter: Option<Arc<dyn OutputFilter>>,
+    /// Out-of-band staging for `sftp_upload`. Bytes arrive via `POST /ingest`
+    /// (see [`crate::ingest_router`]) and are consumed by handle. Override the
+    /// dir and size cap with [`AppState::with_ingest_config`].
+    pub ingest: Arc<IngestStore>,
 }
 
 impl AppState {
@@ -64,7 +69,20 @@ impl AppState {
             idle_timeout_secs,
             max_download_bytes: MAX_OUTPUT_BYTES,
             output_filter: None,
+            ingest: Arc::new(IngestStore::new(
+                std::env::temp_dir().join("conduit-ingest"),
+                DEFAULT_MAX_UPLOAD_BYTES,
+                DEFAULT_INGEST_TTL_SECS,
+            )),
         }
+    }
+
+    /// Override where `POST /ingest` stages uploaded bytes and the per-upload
+    /// size cap (default 16MB). Chain it onto `new` at assembly time:
+    /// `AppState::new(..).with_ingest_config(dir, 64 << 20)`.
+    pub fn with_ingest_config(mut self, dir: std::path::PathBuf, max_bytes: usize) -> Self {
+        self.ingest = Arc::new(IngestStore::new(dir, max_bytes, DEFAULT_INGEST_TTL_SECS));
+        self
     }
 
     /// Override the `sftp_download` byte cap (default 1MB). Chain it onto `new`

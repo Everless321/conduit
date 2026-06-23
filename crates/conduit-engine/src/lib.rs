@@ -27,12 +27,14 @@
 //! ```
 
 pub mod audit;
+pub mod ingest;
 pub mod ratelimit;
 pub mod service;
 pub mod session;
 pub mod state;
 pub mod tools;
 
+pub use ingest::ingest_router;
 pub use ratelimit::RateLimiter;
 pub use service::{bearer_auth, mcp_router, spawn_session_cleaner};
 pub use state::AppState;

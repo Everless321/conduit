@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 use conduit_core::crypto::MasterKey;
 use conduit_core::policy::CommandPolicy;
 use conduit_core::{AuditSink, Authorizer, ServerCatalog, TokenValidator};
-use conduit_engine::{mcp_router, spawn_session_cleaner, AppState, RateLimiter};
+use conduit_engine::{ingest_router, mcp_router, spawn_session_cleaner, AppState, RateLimiter};
 use conduit_store_dibs::DibsStore;
 
 #[derive(Parser, Debug)]
@@ -40,6 +40,13 @@ struct Cli {
     /// Hard cap on bytes returned by sftp_download. Defaults to 1MB.
     #[arg(long, default_value_t = 1_048_576, env = "CONDUIT_MAX_DOWNLOAD_BYTES")]
     max_download_bytes: usize,
+    /// Hard cap on bytes accepted by a single POST /ingest upload. Defaults to 16MB.
+    #[arg(long, default_value_t = 16 << 20, env = "CONDUIT_MAX_UPLOAD_BYTES")]
+    max_upload_bytes: usize,
+    /// Directory where POST /ingest stages uploaded bytes. Defaults to a
+    /// `conduit-ingest` subdir of the system temp dir.
+    #[arg(long, env = "CONDUIT_INGEST_DIR")]
+    ingest_dir: Option<String>,
     #[arg(long, env = "CONDUIT_BLACKLIST_FILE")]
     blacklist_file: Option<String>,
 }
@@ -80,9 +87,14 @@ async fn main() -> anyhow::Result<()> {
     // --- end wiring
 
     let limiter = RateLimiter::new(cli.rate_per_minute);
+    let ingest_dir = cli
+        .ingest_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("conduit-ingest"));
     let state = Arc::new(
         AppState::new(catalog, authz, audit, limiter, cli.idle_timeout_secs)
-            .with_max_download_bytes(cli.max_download_bytes),
+            .with_max_download_bytes(cli.max_download_bytes)
+            .with_ingest_config(ingest_dir, cli.max_upload_bytes),
     );
 
     spawn_session_cleaner(state.clone());
@@ -90,7 +102,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .with_state(state.clone())
-        .merge(mcp_router(state.clone(), validator.clone()));
+        .merge(mcp_router(state.clone(), validator.clone()))
+        .merge(ingest_router(state.clone(), validator.clone()));
 
     let listener = tokio::net::TcpListener::bind(&cli.bind).await.context("bind")?;
     tracing::info!(addr = %cli.bind, "conduit-server listening");

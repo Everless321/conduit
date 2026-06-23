@@ -60,8 +60,10 @@ pub struct SftpUploadParams {
     pub session_id: String,
     #[schemars(description = "Absolute remote file path; existing file is truncated")]
     pub path: String,
-    #[schemars(description = "Base64-encoded file content")]
-    pub content_base64: String,
+    #[schemars(
+        description = "Upload handle returned by POST /ingest. Stream the raw file bytes to the server's /ingest endpoint out-of-band (e.g. `curl --data-binary @file <server>/ingest` with the same bearer token), then pass the returned handle here. File bytes never travel through the tool call."
+    )]
+    pub upload_handle: String,
 }
 
 #[derive(Deserialize, JsonSchema, Default)]
@@ -667,7 +669,7 @@ impl ConduitHandler {
         }
     }
 
-    #[tool(name = "sftp_upload", description = "Upload a file via SFTP. Pass content as base64. Existing file is truncated.")]
+    #[tool(name = "sftp_upload", description = "Upload a file via SFTP from a staged upload handle. First stream the bytes to POST /ingest to get a handle, then pass it as upload_handle. Existing file is truncated.")]
     async fn sftp_upload(
         &self,
         Parameters(params): Parameters<SftpUploadParams>,
@@ -675,9 +677,14 @@ impl ConduitHandler {
     ) -> Result<CallToolResult, McpError> {
         let auth = self.auth(&ctx)?;
         let session = self.session_for(&params.session_id, &auth)?;
-        let bytes = B64
-            .decode(params.content_base64.as_bytes())
-            .map_err(|e| McpError::invalid_request(format!("base64 decode: {e}"), None))?;
+        let staged = self
+            .state
+            .ingest
+            .take(&params.upload_handle, auth.user_id)
+            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+        let bytes = tokio::fs::read(&staged.path)
+            .await
+            .map_err(|e| McpError::internal_error(format!("read staged upload: {e}"), None))?;
         let actx = Self::audit_ctx(&auth, &session.server_alias, &session.id);
         match session.sftp_upload(&params.path, &bytes).await {
             Ok(n) => {
@@ -747,8 +754,10 @@ impl ServerHandler for ConduitHandler {
              exec_start, exec_poll, exec_stop, sftp_list, sftp_download, \
              sftp_upload, close_channel. Use exec for one-shot commands (<=600s); \
              use exec_start + exec_poll + exec_stop to monitor long-running output \
-             (docker logs -f, top -b, tail -f). AI never receives credentials; \
-             only opaque session_ids and job_ids."
+             (docker logs -f, top -b, tail -f). sftp_upload takes an upload_handle, \
+             not file bytes: stream the file to POST /ingest first, then pass the \
+             returned handle. AI never receives credentials; only opaque \
+             session_ids, job_ids, and upload handles."
                 .into(),
         );
         info
