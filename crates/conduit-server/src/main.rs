@@ -37,6 +37,9 @@ struct Cli {
     rate_per_minute: u32,
     #[arg(long, default_value_t = 1800, env = "CONDUIT_IDLE_TIMEOUT_SECS")]
     idle_timeout_secs: i64,
+    /// Hard cap on bytes returned by sftp_download. Defaults to 1MB.
+    #[arg(long, default_value_t = 1_048_576, env = "CONDUIT_MAX_DOWNLOAD_BYTES")]
+    max_download_bytes: usize,
     #[arg(long, env = "CONDUIT_BLACKLIST_FILE")]
     blacklist_file: Option<String>,
 }
@@ -77,7 +80,10 @@ async fn main() -> anyhow::Result<()> {
     // --- end wiring
 
     let limiter = RateLimiter::new(cli.rate_per_minute);
-    let state = Arc::new(AppState::new(catalog, authz, audit, limiter, cli.idle_timeout_secs));
+    let state = Arc::new(
+        AppState::new(catalog, authz, audit, limiter, cli.idle_timeout_secs)
+            .with_max_download_bytes(cli.max_download_bytes),
+    );
 
     spawn_session_cleaner(state.clone());
 

@@ -51,7 +51,7 @@ pub struct SftpDownloadParams {
     pub session_id: String,
     #[schemars(description = "Absolute remote file path")]
     pub path: String,
-    #[schemars(description = "Maximum bytes to read (default 1048576, hard cap 1MB)")]
+    #[schemars(description = "Maximum bytes to read; clamped to the server's download cap (default 1MB). Omit to use the cap.")]
     pub max_bytes: Option<u64>,
 }
 
@@ -622,7 +622,7 @@ impl ConduitHandler {
         }
     }
 
-    #[tool(name = "sftp_download", description = "Download a remote file via SFTP. Returns base64-encoded content, hard cap 1MB.")]
+    #[tool(name = "sftp_download", description = "Download a remote file via SFTP. Returns base64-encoded content, clamped to the server's configured download cap (default 1MB).")]
     async fn sftp_download(
         &self,
         Parameters(params): Parameters<SftpDownloadParams>,
@@ -630,7 +630,11 @@ impl ConduitHandler {
     ) -> Result<CallToolResult, McpError> {
         let auth = self.auth(&ctx)?;
         let session = self.session_for(&params.session_id, &auth)?;
-        let cap = params.max_bytes.unwrap_or(1_048_576) as usize;
+        let limit = self.state.max_download_bytes;
+        let cap = params
+            .max_bytes
+            .map(|b| (b as usize).min(limit))
+            .unwrap_or(limit);
         let actx = Self::audit_ctx(&auth, &session.server_alias, &session.id);
         match session.sftp_download(&params.path, cap).await {
             Ok((buf, truncated)) => {

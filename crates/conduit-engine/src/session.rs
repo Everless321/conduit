@@ -325,14 +325,15 @@ impl SshSession {
         Ok(out)
     }
 
-    pub async fn sftp_download(&self, path: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+    /// Read up to `cap` bytes from `path`. The caller is responsible for
+    /// clamping `cap` to its configured limit (see `AppState::max_download_bytes`).
+    pub async fn sftp_download(&self, path: &str, cap: usize) -> Result<(Vec<u8>, bool)> {
         let sftp = self.open_sftp().await?;
         let mut file = sftp
             .open(path)
             .await
             .map_err(|e| conduit_core::Error::Other(anyhow::anyhow!("open: {e}")))?;
         let mut buf = Vec::new();
-        let cap = max_bytes.min(MAX_OUTPUT_BYTES);
         let mut chunk = [0u8; 32 * 1024];
         let mut truncated = false;
         loop {
